@@ -15,9 +15,9 @@ nest_asyncio.apply()
 DEFAULT_RAG_DIR = "index_default"
 app = FastAPI(title="LightRAG API", description="API for RAG operations")
 
-DEFAULT_INPUT_FILE = "book.txt"
-INPUT_FILE = os.environ.get("INPUT_FILE", f"{DEFAULT_INPUT_FILE}")
-print(f"INPUT_FILE: {INPUT_FILE}")
+#DEFAULT_INPUT_FILE = "book.txt"
+#INPUT_FILE = os.environ.get("INPUT_FILE", f"{DEFAULT_INPUT_FILE}")
+#print(f"INPUT_FILE: {INPUT_FILE}")
 
 # Configure working directory
 WORKING_DIR = os.environ.get("RAG_DIR", f"{DEFAULT_RAG_DIR}")
@@ -115,25 +115,25 @@ async def insert_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# insert by local default file
-@app.post("/insert_default_file", response_model=Response)
-@app.get("/insert_default_file", response_model=Response)
-async def insert_default_file():
-    try:
-        # Read file content from book.txt
-        async with aiofiles.open(INPUT_FILE, "r", encoding="utf-8") as file:
-            content = await file.read()
-        print(f"read input file {INPUT_FILE} successfully")
-        # Insert file content
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: rag.insert(content))
-
-        return Response(
-            status="success",
-            message=f"File content from {INPUT_FILE} inserted successfully",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+## insert by local default file
+#@app.post("/insert_default_file", response_model=Response)
+#@app.get("/insert_default_file", response_model=Response)
+#async def insert_default_file():
+#    try:
+#        # Read file content from book.txt
+#        async with aiofiles.open(INPUT_FILE, "r", encoding="utf-8") as file:
+#            content = await file.read()
+#        print(f"read input file {INPUT_FILE} successfully")
+#        # Insert file content
+#        loop = asyncio.get_event_loop()
+#        await loop.run_in_executor(None, lambda: rag.insert(content))
+#
+#        return Response(
+#            status="success",
+#            message=f"File content from {INPUT_FILE} inserted successfully",
+#        )
+#    except Exception as e:
+#        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/health")
