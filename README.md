@@ -36,6 +36,7 @@ This repository hosts the code of LightRAG. The structure of this code is based 
 </div>
 
 ## 🎉 News
+- [x] [2025.02.05]🎯📢Our team has released [VideoRAG](https://github.com/HKUDS/VideoRAG) for processing and understanding extremely long-context videos.
 - [x] [2025.01.13]🎯📢Our team has released [MiniRAG](https://github.com/HKUDS/MiniRAG) making RAG simpler with small models.
 - [x] [2025.01.06]🎯📢You can now [use PostgreSQL for Storage](#using-postgresql-for-storage).
 - [x] [2024.12.31]🎯📢LightRAG now supports [deletion by document ID](https://github.com/HKUDS/LightRAG?tab=readme-ov-file#delete).
@@ -360,6 +361,8 @@ class QueryParam:
     max_token_for_local_context: int = 4000
 ```
 
+> default value of Top_k can be change by environment  variables  TOP_K.
+
 ### Batch Insert
 
 ```python
@@ -453,9 +456,38 @@ For production level scenarios you will most likely want to leverage an enterpri
 * If you prefer docker, please start with this image if you are a beginner to avoid hiccups (DO read the overview): https://hub.docker.com/r/shangor/postgres-for-rag
 * How to start? Ref to: [examples/lightrag_zhipu_postgres_demo.py](https://github.com/HKUDS/LightRAG/blob/main/examples/lightrag_zhipu_postgres_demo.py)
 * Create index for AGE example: (Change below `dickens` to your graph name if necessary)
-  ```
+  ```sql
+  load 'age';
   SET search_path = ag_catalog, "$user", public;
-  CREATE INDEX idx_entity ON dickens."Entity" USING gin (agtype_access_operator(properties, '"node_id"'));
+  CREATE INDEX CONCURRENTLY entity_p_idx ON dickens."Entity" (id);
+  CREATE INDEX CONCURRENTLY vertex_p_idx ON dickens."_ag_label_vertex" (id);
+  CREATE INDEX CONCURRENTLY directed_p_idx ON dickens."DIRECTED" (id);
+  CREATE INDEX CONCURRENTLY directed_eid_idx ON dickens."DIRECTED" (end_id);
+  CREATE INDEX CONCURRENTLY directed_sid_idx ON dickens."DIRECTED" (start_id);
+  CREATE INDEX CONCURRENTLY directed_seid_idx ON dickens."DIRECTED" (start_id,end_id);
+  CREATE INDEX CONCURRENTLY edge_p_idx ON dickens."_ag_label_edge" (id);
+  CREATE INDEX CONCURRENTLY edge_sid_idx ON dickens."_ag_label_edge" (start_id);
+  CREATE INDEX CONCURRENTLY edge_eid_idx ON dickens."_ag_label_edge" (end_id);
+  CREATE INDEX CONCURRENTLY edge_seid_idx ON dickens."_ag_label_edge" (start_id,end_id);
+  create INDEX CONCURRENTLY vertex_idx_node_id ON dickens."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, '"node_id"'::agtype));
+  create INDEX CONCURRENTLY entity_idx_node_id ON dickens."Entity" (ag_catalog.agtype_access_operator(properties, '"node_id"'::agtype));
+  CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON dickens."Entity" using gin(properties);
+  ALTER TABLE dickens."DIRECTED" CLUSTER ON directed_sid_idx;
+
+  -- drop if necessary
+  drop INDEX entity_p_idx;
+  drop INDEX vertex_p_idx;
+  drop INDEX directed_p_idx;
+  drop INDEX directed_eid_idx;
+  drop INDEX directed_sid_idx;
+  drop INDEX directed_seid_idx;
+  drop INDEX edge_p_idx;
+  drop INDEX edge_sid_idx;
+  drop INDEX edge_eid_idx;
+  drop INDEX edge_seid_idx;
+  drop INDEX vertex_idx_node_id;
+  drop INDEX entity_idx_node_id;
+  drop INDEX entity_node_id_gin_idx;
   ```
 * Known issue of the Apache AGE: The released versions got below issue:
   > You might find that the properties of the nodes/edges are empty.
@@ -463,7 +495,36 @@ For production level scenarios you will most likely want to leverage an enterpri
   >
   > You can Compile the AGE from source code and fix it.
 
+### Using Faiss for Storage
+- Install the required dependencies:
+```
+pip install faiss-cpu
+```
+You can also install `faiss-gpu` if you have GPU support.
 
+- Here we are using `sentence-transformers` but you can also use `OpenAIEmbedding` model with `3072` dimensions.
+
+```
+async def embedding_func(texts: list[str]) -> np.ndarray:
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    embeddings = model.encode(texts, convert_to_numpy=True)
+    return embeddings
+
+# Initialize LightRAG with the LLM model function and embedding function
+    rag = LightRAG(
+        working_dir=WORKING_DIR,
+        llm_model_func=llm_model_func,
+        embedding_func=EmbeddingFunc(
+            embedding_dim=384,
+            max_token_size=8192,
+            func=embedding_func,
+        ),
+        vector_storage="FaissVectorDBStorage",
+        vector_db_storage_cls_kwargs={
+            "cosine_better_than_threshold": 0.3  # Your desired threshold
+        }
+    )
+```
 
 ### Insert Custom KG
 
@@ -730,17 +791,19 @@ if __name__ == "__main__":
 | **embedding\_func\_max\_async**              | `int` | Maximum number of concurrent asynchronous embedding processes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | `16`                                                                                                        |
 | **llm\_model\_func**                         | `callable` | Function for LLM generation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | `gpt_4o_mini_complete`                                                                                      |
 | **llm\_model\_name**                         | `str` | LLM model name for generation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | `meta-llama/Llama-3.2-1B-Instruct`                                                                          |
-| **llm\_model\_max\_token\_size**             | `int` | Maximum token size for LLM generation (affects entity relation summaries)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | `32768`                                                                                                     |
-| **llm\_model\_max\_async**                   | `int` | Maximum number of concurrent asynchronous LLM processes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | `16`                                                                                                        |
+| **llm\_model\_max\_token\_size**             | `int` | Maximum token size for LLM generation (affects entity relation summaries)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | `32768`（default value changed by  env var MAX_TOKENS)                                    |
+| **llm\_model\_max\_async**                   | `int` | Maximum number of concurrent asynchronous LLM processes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | `16`（default value changed by  env var MAX_ASYNC)                                           |
 | **llm\_model\_kwargs**                       | `dict` | Additional parameters for LLM generation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |                                                                                                             |
-| **vector\_db\_storage\_cls\_kwargs**         | `dict` | Additional parameters for vector database (currently not used)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |                                                                                                             |
+| **vector\_db\_storage\_cls\_kwargs**         | `dict` | Additional parameters for vector database, like setting the threshold for nodes and relations retrieval.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              | cosine_better_than_threshold: 0.2（default value changed by  env var COSINE_THRESHOLD) |
 | **enable\_llm\_cache**                       | `bool` | If `TRUE`, stores LLM results in cache; repeated prompts return cached responses                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | `TRUE`                                                                                                      |
 | **enable\_llm\_cache\_for\_entity\_extract** | `bool` | If `TRUE`, stores LLM results in cache for entity extraction; Good for beginners to debug your application                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | `TRUE`                                                                                                     |
 | **addon\_params**                            | `dict` | Additional parameters, e.g., `{"example_number": 1, "language": "Simplified Chinese", "entity_types": ["organization", "person", "geo", "event"], "insert_batch_size": 10}`: sets example limit, output language, and batch size for document processing                                                                                                                                                                                                                                                                                                                                                                                                                            | `example_number: all examples, language: English, insert_batch_size: 10`                                    |
 | **convert\_response\_to\_json\_func**        | `callable` | Not used                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `convert_response_to_json`                                                                                  |
 | **embedding\_cache\_config**                 | `dict` | Configuration for question-answer caching. Contains three parameters:<br>- `enabled`: Boolean value to enable/disable cache lookup functionality. When enabled, the system will check cached responses before generating new answers.<br>- `similarity_threshold`: Float value (0-1), similarity threshold. When a new question's similarity with a cached question exceeds this threshold, the cached answer will be returned directly without calling the LLM.<br>- `use_llm_check`: Boolean value to enable/disable LLM similarity verification. When enabled, LLM will be used as a secondary check to verify the similarity between questions before returning cached answers. | Default: `{"enabled": False, "similarity_threshold": 0.95, "use_llm_check": False}`                         |
+|**log\_dir**                                  | `str`  | Directory to store logs.                                                                                                                   | `./`                                                                                                    |
 
 ### Error Handling
+
 <details>
 <summary>Click to view error handling details</summary>
 
@@ -995,6 +1058,12 @@ def extract_queries(file_path):
 LightRag can be installed with API support to serve a Fast api interface to perform data upload and indexing/Rag operations/Rescan of the input folder etc..
 
 The documentation can be found [here](lightrag/api/README.md)
+
+## Graph viewer
+LightRag can be installed with Tools support to add extra tools like the graphml 3d visualizer.
+
+The documentation can be found [here](lightrag/tools/lightrag_visualizer/README.md)
+
 
 ## Star History
 

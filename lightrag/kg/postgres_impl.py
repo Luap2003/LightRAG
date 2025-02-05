@@ -30,6 +30,7 @@ from ..base import (
     DocStatus,
     DocProcessingStatus,
     BaseGraphStorage,
+    T,
 )
 
 if sys.platform.startswith("win"):
@@ -301,12 +302,14 @@ class PGKVStorage(BaseKVStorage):
 
 @dataclass
 class PGVectorStorage(BaseVectorStorage):
-    cosine_better_than_threshold: float = 0.2
+    cosine_better_than_threshold: float = float(os.getenv("COSINE_THRESHOLD", "0.2"))
     db: PostgreSQLDB = None
 
     def __post_init__(self):
         self._max_batch_size = self.global_config["embedding_batch_num"]
-        self.cosine_better_than_threshold = self.global_config.get(
+        # Use global config value if specified, otherwise use default
+        config = self.global_config.get("vector_db_storage_cls_kwargs", {})
+        self.cosine_better_than_threshold = config.get(
             "cosine_better_than_threshold", self.cosine_better_than_threshold
         )
 
@@ -439,6 +442,22 @@ class PGDocStatusStorage(DocStatusStorage):
         else:
             existed = set([element["id"] for element in result])
             return set(data) - existed
+
+    async def get_by_id(self, id: str) -> Union[T, None]:
+        sql = "select * from LIGHTRAG_DOC_STATUS where workspace=$1 and id=$2"
+        params = {"workspace": self.db.workspace, "id": id}
+        result = await self.db.query(sql, params, True)
+        if result is None or result == []:
+            return None
+        else:
+            return DocProcessingStatus(
+                content_length=result[0]["content_length"],
+                content_summary=result[0]["content_summary"],
+                status=result[0]["status"],
+                chunks_count=result[0]["chunks_count"],
+                created_at=result[0]["created_at"],
+                updated_at=result[0]["updated_at"],
+            )
 
     async def get_status_counts(self) -> Dict[str, int]:
         """Get counts of documents in each status"""
@@ -882,9 +901,9 @@ class PGGraphStorage(BaseGraphStorage):
 
         query = """SELECT * FROM cypher('%s', $$
                       MATCH (n:Entity {node_id: "%s"})
-                      OPTIONAL MATCH (n)-[r]-(connected)
-                      RETURN n, r, connected
-                    $$) AS (n agtype, r agtype, connected agtype)""" % (
+                      OPTIONAL MATCH (n)-[]-(connected)
+                      RETURN n, connected
+                    $$) AS (n agtype, connected agtype)""" % (
             self.graph_name,
             label,
         )

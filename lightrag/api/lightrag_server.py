@@ -1,12 +1,28 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Request
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    File,
+    UploadFile,
+    Form,
+    Request,
+    BackgroundTasks,
+)
+
+# Backend (Python)
+# Add this to store progress globally
+from typing import Dict
+import threading
+import asyncio
+import json
+import os
+
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import logging
 import argparse
-import json
 import time
 import re
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Any, Optional, Union
 from lightrag import LightRAG, QueryParam
 from lightrag.api import __api_version__
 
@@ -16,7 +32,6 @@ from pathlib import Path
 import shutil
 import aiofiles
 from ascii_colors import trace_exception, ASCIIColors
-import os
 import sys
 import configparser
 
@@ -30,7 +45,20 @@ import pipmaster as pm
 
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
+
+# Global progress tracker
+scan_progress: Dict = {
+    "is_scanning": False,
+    "current_file": "",
+    "indexed_count": 0,
+    "total_files": 0,
+    "progress": 0,
+}
+
+# Lock for thread-safe operations
+progress_lock = threading.Lock()
 
 
 def estimate_tokens(text: str) -> int:
@@ -212,8 +240,12 @@ def display_splash_screen(args: argparse.Namespace) -> None:
     ASCIIColors.yellow(f"{args.chunk_size}")
     ASCIIColors.white("    ├─ Chunk Overlap Size: ", end="")
     ASCIIColors.yellow(f"{args.chunk_overlap_size}")
-    ASCIIColors.white("    └─ History Turns: ", end="")
+    ASCIIColors.white("    ├─ History Turns: ", end="")
     ASCIIColors.yellow(f"{args.history_turns}")
+    ASCIIColors.white("    ├─ Cosine Threshold: ", end="")
+    ASCIIColors.yellow(f"{args.cosine_threshold}")
+    ASCIIColors.white("    └─ Top-K: ", end="")
+    ASCIIColors.yellow(f"{args.top_k}")
 
     # System Configuration
     ASCIIColors.magenta("\n🛠️ System Configuration:")
@@ -489,6 +521,20 @@ def parse_args() -> argparse.Namespace:
         help="Number of conversation history turns to include (default: from env or 3)",
     )
 
+    # Search parameters
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=get_env_value("TOP_K", 50, int),
+        help="Number of most similar results to return (default: from env or 50)",
+    )
+    parser.add_argument(
+        "--cosine-threshold",
+        type=float,
+        default=get_env_value("COSINE_THRESHOLD", 0.4, float),
+        help="Cosine similarity threshold (default: from env or 0.4)",
+    )
+
     parser.add_argument(
         "--simulated-model-name",
         type=str,
@@ -511,7 +557,14 @@ class DocumentManager:
     def __init__(
         self,
         input_dir: str,
-        supported_extensions: tuple = (".txt", ".md", ".pdf", ".docx", ".pptx"),
+        supported_extensions: tuple = (
+            ".txt",
+            ".md",
+            ".pdf",
+            ".docx",
+            ".pptx",
+            ".xlsx",
+        ),
     ):
         self.input_dir = Path(input_dir)
         self.supported_extensions = supported_extensions
@@ -520,13 +573,21 @@ class DocumentManager:
         # Create input directory if it doesn't exist
         self.input_dir.mkdir(parents=True, exist_ok=True)
 
-    def scan_directory(self) -> List[Path]:
+    def scan_directory_for_new_files(self) -> List[Path]:
         """Scan input directory for new files"""
         new_files = []
         for ext in self.supported_extensions:
             for file_path in self.input_dir.rglob(f"*{ext}"):
                 if file_path not in self.indexed_files:
                     new_files.append(file_path)
+        return new_files
+
+    def scan_directory(self) -> List[Path]:
+        """Scan input directory for new files"""
+        new_files = []
+        for ext in self.supported_extensions:
+            for file_path in self.input_dir.rglob(f"*{ext}"):
+                new_files.append(file_path)
         return new_files
 
     def mark_as_indexed(self, file_path: Path):
@@ -545,6 +606,7 @@ class SearchMode(str, Enum):
     global_ = "global"
     hybrid = "hybrid"
     mix = "mix"
+    bypass = "bypass"
 
 
 class OllamaMessage(BaseModel):
@@ -712,7 +774,7 @@ def create_app(args):
         # Startup logic
         if args.auto_scan_at_startup:
             try:
-                new_files = doc_manager.scan_directory()
+                new_files = doc_manager.scan_directory_for_new_files()
                 for file_path in new_files:
                     try:
                         await index_file(file_path)
@@ -862,6 +924,15 @@ def create_app(args):
             graph_storage=ollama_server_infos.GRAPH_STORAGE,
             vector_storage=ollama_server_infos.VECTOR_STORAGE,
             doc_status_storage=ollama_server_infos.DOC_STATUS_STORAGE,
+            vector_db_storage_cls_kwargs={
+                "cosine_better_than_threshold": args.cosine_threshold
+            },
+            enable_llm_cache_for_entity_extract=False,  # set to True for debuging to reduce llm fee
+            embedding_cache_config={
+                "enabled": True,
+                "similarity_threshold": 0.95,
+                "use_llm_check": False,
+            },
         )
     else:
         rag = LightRAG(
@@ -871,6 +942,9 @@ def create_app(args):
             else openai_alike_model_complete,
             chunk_token_size=int(args.chunk_size),
             chunk_overlap_token_size=int(args.chunk_overlap_size),
+            llm_model_kwargs={
+                "timeout": args.timeout,
+            },
             llm_model_name=args.llm_model,
             llm_model_max_async=args.max_async,
             llm_model_max_token_size=args.max_tokens,
@@ -879,6 +953,15 @@ def create_app(args):
             graph_storage=ollama_server_infos.GRAPH_STORAGE,
             vector_storage=ollama_server_infos.VECTOR_STORAGE,
             doc_status_storage=ollama_server_infos.DOC_STATUS_STORAGE,
+            vector_db_storage_cls_kwargs={
+                "cosine_better_than_threshold": args.cosine_threshold
+            },
+            enable_llm_cache_for_entity_extract=False,  # set to True for debuging to reduce llm fee
+            embedding_cache_config={
+                "enabled": True,
+                "similarity_threshold": 0.95,
+                "use_llm_check": False,
+            },
         )
 
     async def index_file(file_path: Union[str, Path]) -> None:
@@ -911,38 +994,14 @@ def create_app(args):
                 async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
                     content = await f.read()
 
-            case ".pdf":
-                if not pm.is_installed("pypdf2"):
-                    pm.install("pypdf2")
-                from PyPDF2 import PdfReader
+            case ".pdf" | ".docx" | ".pptx" | ".xlsx":
+                if not pm.is_installed("docling"):
+                    pm.install("docling")
+                from docling.document_converter import DocumentConverter
 
-                # PDF handling
-                reader = PdfReader(str(file_path))
-                content = ""
-                for page in reader.pages:
-                    content += page.extract_text() + "\n"
-
-            case ".docx":
-                if not pm.is_installed("python-docx"):
-                    pm.install("python-docx")
-                from docx import Document
-
-                # Word document handling
-                doc = Document(file_path)
-                content = "\n".join([paragraph.text for paragraph in doc.paragraphs])
-
-            case ".pptx":
-                if not pm.is_installed("pptx"):
-                    pm.install("pptx")
-                from pptx import Presentation  # type: ignore
-
-                # PowerPoint handling
-                prs = Presentation(file_path)
-                content = ""
-                for slide in prs.slides:
-                    for shape in slide.shapes:
-                        if hasattr(shape, "text"):
-                            content += shape.text + "\n"
+                converter = DocumentConverter()
+                result = converter.convert(file_path)
+                content = result.document.export_to_markdown()
 
             case _:
                 raise ValueError(f"Unsupported file format: {ext}")
@@ -956,42 +1015,59 @@ def create_app(args):
             logging.warning(f"No content extracted from file: {file_path}")
 
     @app.post("/documents/scan", dependencies=[Depends(optional_api_key)])
-    async def scan_for_new_documents():
-        """
-        Manually trigger scanning for new documents in the directory managed by `doc_manager`.
+    async def scan_for_new_documents(background_tasks: BackgroundTasks):
+        """Trigger the scanning process"""
+        global scan_progress
 
-        This endpoint facilitates manual initiation of a document scan to identify and index new files.
-        It processes all newly detected files, attempts indexing each file, logs any errors that occur,
-        and returns a summary of the operation.
+        with progress_lock:
+            if scan_progress["is_scanning"]:
+                return {"status": "already_scanning"}
 
-        Returns:
-            dict: A dictionary containing:
-                - "status" (str): Indicates success or failure of the scanning process.
-                - "indexed_count" (int): The number of successfully indexed documents.
-                - "total_documents" (int): Total number of documents that have been indexed so far.
+            scan_progress["is_scanning"] = True
+            scan_progress["indexed_count"] = 0
+            scan_progress["progress"] = 0
 
-        Raises:
-            HTTPException: If an error occurs during the document scanning process, a 500 status
-                           code is returned with details about the exception.
-        """
+        # Start the scanning process in the background
+        background_tasks.add_task(run_scanning_process)
+
+        return {"status": "scanning_started"}
+
+    async def run_scanning_process():
+        """Background task to scan and index documents"""
+        global scan_progress
+
         try:
-            new_files = doc_manager.scan_directory()
-            indexed_count = 0
+            new_files = doc_manager.scan_directory_for_new_files()
+            scan_progress["total_files"] = len(new_files)
 
             for file_path in new_files:
                 try:
+                    with progress_lock:
+                        scan_progress["current_file"] = os.path.basename(file_path)
+
                     await index_file(file_path)
-                    indexed_count += 1
+
+                    with progress_lock:
+                        scan_progress["indexed_count"] += 1
+                        scan_progress["progress"] = (
+                            scan_progress["indexed_count"]
+                            / scan_progress["total_files"]
+                        ) * 100
+
                 except Exception as e:
                     logging.error(f"Error indexing file {file_path}: {str(e)}")
 
-            return {
-                "status": "success",
-                "indexed_count": indexed_count,
-                "total_documents": len(doc_manager.indexed_files),
-            }
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            logging.error(f"Error during scanning process: {str(e)}")
+        finally:
+            with progress_lock:
+                scan_progress["is_scanning"] = False
+
+    @app.get("/documents/scan-progress")
+    async def get_scan_progress():
+        """Get the current scanning progress"""
+        with progress_lock:
+            return scan_progress
 
     @app.post("/documents/upload", dependencies=[Depends(optional_api_key)])
     async def upload_to_input_dir(file: UploadFile = File(...)):
@@ -1068,6 +1144,7 @@ def create_app(args):
                     mode=request.mode,
                     stream=request.stream,
                     only_need_context=request.only_need_context,
+                    top_k=args.top_k,
                 ),
             )
 
@@ -1109,6 +1186,7 @@ def create_app(args):
                     mode=request.mode,
                     stream=True,
                     only_need_context=request.only_need_context,
+                    top_k=args.top_k,
                 ),
             )
 
@@ -1201,55 +1279,26 @@ def create_app(args):
                     text_content = await file.read()
                     content = text_content.decode("utf-8")
 
-                case ".pdf":
-                    if not pm.is_installed("pypdf2"):
-                        pm.install("pypdf2")
-                    from PyPDF2 import PdfReader
-                    from io import BytesIO
+                case ".pdf" | ".docx" | ".pptx" | ".xlsx":
+                    if not pm.is_installed("docling"):
+                        pm.install("docling")
+                    from docling.document_converter import DocumentConverter
 
-                    # Read PDF from memory
-                    pdf_content = await file.read()
-                    pdf_file = BytesIO(pdf_content)
-                    reader = PdfReader(pdf_file)
-                    content = ""
-                    for page in reader.pages:
-                        content += page.extract_text() + "\n"
+                    # Create a temporary file to save the uploaded content
+                    temp_path = Path("temp") / file.filename
+                    temp_path.parent.mkdir(exist_ok=True)
 
-                case ".docx":
-                    if not pm.is_installed("python-docx"):
-                        pm.install("python-docx")
-                    from docx import Document
-                    from io import BytesIO
+                    # Save the uploaded file
+                    with temp_path.open("wb") as f:
+                        f.write(await file.read())
 
-                    # Read DOCX from memory
-                    docx_content = await file.read()
-                    docx_file = BytesIO(docx_content)
-                    doc = Document(docx_file)
-                    content = "\n".join(
-                        [paragraph.text for paragraph in doc.paragraphs]
-                    )
-
-                case ".pptx":
-                    if not pm.is_installed("pptx"):
-                        pm.install("pptx")
-                    from pptx import Presentation  # type: ignore
-                    from io import BytesIO
-
-                    # Read PPTX from memory
-                    pptx_content = await file.read()
-                    pptx_file = BytesIO(pptx_content)
-                    prs = Presentation(pptx_file)
-                    content = ""
-                    for slide in prs.slides:
-                        for shape in slide.shapes:
-                            if hasattr(shape, "text"):
-                                content += shape.text + "\n"
-
-                case _:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
-                    )
+                    try:
+                        converter = DocumentConverter()
+                        result = converter.convert(str(temp_path))
+                        content = result.document.export_to_markdown()
+                    finally:
+                        # Clean up the temporary file
+                        temp_path.unlink()
 
             # Insert content into RAG system
             if content:
@@ -1435,7 +1484,7 @@ def create_app(args):
 
     @app.get("/api/tags")
     async def get_tags():
-        """Get available models"""
+        """Retrun available models acting as an Ollama server"""
         return OllamaTagResponse(
             models=[
                 {
@@ -1466,6 +1515,7 @@ def create_app(args):
             "/naive ": SearchMode.naive,
             "/hybrid ": SearchMode.hybrid,
             "/mix ": SearchMode.mix,
+            "/bypass ": SearchMode.bypass,
         }
 
         for prefix, mode in mode_map.items():
@@ -1478,7 +1528,7 @@ def create_app(args):
 
     @app.post("/api/generate")
     async def generate(raw_request: Request, request: OllamaGenerateRequest):
-        """Handle generate completion requests
+        """Handle generate completion requests acting as an Ollama model
         For compatiblity purpuse, the request is not processed by LightRAG,
         and will be handled by underlying LLM model.
         """
@@ -1620,7 +1670,7 @@ def create_app(args):
 
     @app.post("/api/chat")
     async def chat(raw_request: Request, request: OllamaChatRequest):
-        """Process chat completion requests.
+        """Process chat completion requests acting as an Ollama model
         Routes user queries through LightRAG by selecting query mode based on prefix indicators.
         Detects and forwards OpenWebUI session-related requests (for meta data generation task) directly to LLM.
         """
@@ -1648,6 +1698,7 @@ def create_app(args):
                 "stream": request.stream,
                 "only_need_context": False,
                 "conversation_history": conversation_history,
+                "top_k": args.top_k,
             }
 
             if args.history_turns is not None:
@@ -1658,16 +1709,27 @@ def create_app(args):
             if request.stream:
                 from fastapi.responses import StreamingResponse
 
-                response = await rag.aquery(  # Need await to get async generator
-                    cleaned_query, param=query_param
-                )
+                # Determine if the request is prefix with "/bypass"
+                if mode == SearchMode.bypass:
+                    if request.system:
+                        rag.llm_model_kwargs["system_prompt"] = request.system
+                    response = await rag.llm_model_func(
+                        cleaned_query,
+                        stream=True,
+                        history_messages=conversation_history,
+                        **rag.llm_model_kwargs,
+                    )
+                else:
+                    response = await rag.aquery(  # Need await to get async generator
+                        cleaned_query, param=query_param
+                    )
 
                 async def stream_generator():
-                    try:
-                        first_chunk_time = None
-                        last_chunk_time = None
-                        total_response = ""
+                    first_chunk_time = None
+                    last_chunk_time = None
+                    total_response = ""
 
+                    try:
                         # Ensure response is an async generator
                         if isinstance(response, str):
                             # If it's a string, send in two parts
@@ -1705,47 +1767,96 @@ def create_app(args):
                             }
                             yield f"{json.dumps(data, ensure_ascii=False)}\n"
                         else:
-                            async for chunk in response:
-                                if chunk:
-                                    if first_chunk_time is None:
-                                        first_chunk_time = time.time_ns()
+                            try:
+                                async for chunk in response:
+                                    if chunk:
+                                        if first_chunk_time is None:
+                                            first_chunk_time = time.time_ns()
 
-                                    last_chunk_time = time.time_ns()
+                                        last_chunk_time = time.time_ns()
 
-                                    total_response += chunk
-                                    data = {
-                                        "model": ollama_server_infos.LIGHTRAG_MODEL,
-                                        "created_at": ollama_server_infos.LIGHTRAG_CREATED_AT,
-                                        "message": {
-                                            "role": "assistant",
-                                            "content": chunk,
-                                            "images": None,
-                                        },
-                                        "done": False,
-                                    }
-                                    yield f"{json.dumps(data, ensure_ascii=False)}\n"
+                                        total_response += chunk
+                                        data = {
+                                            "model": ollama_server_infos.LIGHTRAG_MODEL,
+                                            "created_at": ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": chunk,
+                                                "images": None,
+                                            },
+                                            "done": False,
+                                        }
+                                        yield f"{json.dumps(data, ensure_ascii=False)}\n"
+                            except (asyncio.CancelledError, Exception) as e:
+                                error_msg = str(e)
+                                if isinstance(e, asyncio.CancelledError):
+                                    error_msg = "Stream was cancelled by server"
+                                else:
+                                    error_msg = f"Provider error: {error_msg}"
 
-                            completion_tokens = estimate_tokens(total_response)
-                            total_time = last_chunk_time - start_time
-                            prompt_eval_time = first_chunk_time - start_time
-                            eval_time = last_chunk_time - first_chunk_time
+                                logging.error(f"Stream error: {error_msg}")
 
-                            data = {
-                                "model": ollama_server_infos.LIGHTRAG_MODEL,
-                                "created_at": ollama_server_infos.LIGHTRAG_CREATED_AT,
-                                "done": True,
-                                "total_duration": total_time,
-                                "load_duration": 0,
-                                "prompt_eval_count": prompt_tokens,
-                                "prompt_eval_duration": prompt_eval_time,
-                                "eval_count": completion_tokens,
-                                "eval_duration": eval_time,
-                            }
-                            yield f"{json.dumps(data, ensure_ascii=False)}\n"
-                            return  # Ensure the generator ends immediately after sending the completion marker
+                                # Send error message to client
+                                error_data = {
+                                    "model": ollama_server_infos.LIGHTRAG_MODEL,
+                                    "created_at": ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": f"\n\nError: {error_msg}",
+                                        "images": None,
+                                    },
+                                    "done": False,
+                                }
+                                yield f"{json.dumps(error_data, ensure_ascii=False)}\n"
+
+                                # Send final message to close the stream
+                                final_data = {
+                                    "model": ollama_server_infos.LIGHTRAG_MODEL,
+                                    "created_at": ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                    "done": True,
+                                }
+                                yield f"{json.dumps(final_data, ensure_ascii=False)}\n"
+                                return
+
+                            if last_chunk_time is not None:
+                                completion_tokens = estimate_tokens(total_response)
+                                total_time = last_chunk_time - start_time
+                                prompt_eval_time = first_chunk_time - start_time
+                                eval_time = last_chunk_time - first_chunk_time
+
+                                data = {
+                                    "model": ollama_server_infos.LIGHTRAG_MODEL,
+                                    "created_at": ollama_server_infos.LIGHTRAG_CREATED_AT,
+                                    "done": True,
+                                    "total_duration": total_time,
+                                    "load_duration": 0,
+                                    "prompt_eval_count": prompt_tokens,
+                                    "prompt_eval_duration": prompt_eval_time,
+                                    "eval_count": completion_tokens,
+                                    "eval_duration": eval_time,
+                                }
+                                yield f"{json.dumps(data, ensure_ascii=False)}\n"
+
                     except Exception as e:
-                        logging.error(f"Error in stream_generator: {str(e)}")
-                        raise
+                        error_msg = f"Error in stream_generator: {str(e)}"
+                        logging.error(error_msg)
+
+                        # Send error message to client
+                        error_data = {
+                            "model": ollama_server_infos.LIGHTRAG_MODEL,
+                            "created_at": ollama_server_infos.LIGHTRAG_CREATED_AT,
+                            "error": {"code": "STREAM_ERROR", "message": error_msg},
+                        }
+                        yield f"{json.dumps(error_data, ensure_ascii=False)}\n"
+
+                        # Ensure sending end marker
+                        final_data = {
+                            "model": ollama_server_infos.LIGHTRAG_MODEL,
+                            "created_at": ollama_server_infos.LIGHTRAG_CREATED_AT,
+                            "done": True,
+                        }
+                        yield f"{json.dumps(final_data, ensure_ascii=False)}\n"
+                        return
 
                 return StreamingResponse(
                     stream_generator(),
@@ -1762,16 +1873,19 @@ def create_app(args):
             else:
                 first_chunk_time = time.time_ns()
 
-                # Determine if the request is from Open WebUI's session title and session keyword generation task
+                # Determine if the request is prefix with "/bypass" or from Open WebUI's session title and session keyword generation task
                 match_result = re.search(
                     r"\n<chat_history>\nUSER:", cleaned_query, re.MULTILINE
                 )
-                if match_result:
+                if match_result or mode == SearchMode.bypass:
                     if request.system:
                         rag.llm_model_kwargs["system_prompt"] = request.system
 
                     response_text = await rag.llm_model_func(
-                        cleaned_query, stream=False, **rag.llm_model_kwargs
+                        cleaned_query,
+                        stream=False,
+                        history_messages=conversation_history,
+                        **rag.llm_model_kwargs,
                     )
                 else:
                     response_text = await rag.aquery(cleaned_query, param=query_param)
@@ -1819,7 +1933,7 @@ def create_app(args):
             "status": "healthy",
             "working_directory": str(args.working_dir),
             "input_directory": str(args.input_dir),
-            "indexed_files": files,
+            "indexed_files": [str(f) for f in files],
             "indexed_files_count": len(files),
             "configuration": {
                 # LLM configuration binding/host address (if applicable)/model (if applicable)

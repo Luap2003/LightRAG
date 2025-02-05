@@ -60,6 +60,7 @@ STORAGES = {
     "PGGraphStorage": ".kg.postgres_impl",
     "GremlinStorage": ".kg.gremlin_impl",
     "PGDocStatusStorage": ".kg.postgres_impl",
+    "FaissVectorDBStorage": ".kg.faiss_impl",
 }
 
 
@@ -125,8 +126,10 @@ class LightRAG:
     vector_storage: str = field(default="NanoVectorDBStorage")
     graph_storage: str = field(default="NetworkXStorage")
 
+    # logging
     current_log_level = logger.level
     log_level: str = field(default=current_log_level)
+    log_dir: str = field(default=os.getcwd())
 
     # text chunking
     chunk_token_size: int = 1200
@@ -158,8 +161,8 @@ class LightRAG:
     # LLM
     llm_model_func: callable = None  # This must be set (we do want to separate llm from the corte, so no more default initialization)
     llm_model_name: str = "meta-llama/Llama-3.2-1B-Instruct"  # 'meta-llama/Llama-3.2-1B'#'google/gemma-2-2b-it'
-    llm_model_max_token_size: int = 32768
-    llm_model_max_async: int = 16
+    llm_model_max_token_size: int = int(os.getenv("MAX_TOKENS", "32768"))
+    llm_model_max_async: int = int(os.getenv("MAX_ASYNC", "16"))
     llm_model_kwargs: dict = field(default_factory=dict)
 
     # storage
@@ -181,10 +184,11 @@ class LightRAG:
     chunking_func_kwargs: dict = field(default_factory=dict)
 
     def __post_init__(self):
-        log_file = os.path.join("lightrag.log")
+        os.makedirs(self.log_dir, exist_ok=True)
+        log_file = os.path.join(self.log_dir, "lightrag.log")
         set_logger(log_file)
-        logger.setLevel(self.log_level)
 
+        logger.setLevel(self.log_level)
         logger.info(f"Logger initialized for working directory: {self.working_dir}")
         if not os.path.exists(self.working_dir):
             logger.info(f"Creating working directory {self.working_dir}")
@@ -230,7 +234,7 @@ class LightRAG:
 
         self.llm_response_cache = self.key_string_value_json_storage_cls(
             namespace="llm_response_cache",
-            embedding_func=None,
+            embedding_func=self.embedding_func,
         )
 
         ####
@@ -274,7 +278,7 @@ class LightRAG:
         else:
             hashing_kv = self.key_string_value_json_storage_cls(
                 namespace="llm_response_cache",
-                embedding_func=None,
+                embedding_func=self.embedding_func,
             )
 
         self.llm_model_func = limit_async_func_call(self.llm_model_max_async)(
@@ -368,12 +372,23 @@ class LightRAG:
 
         # 3. Filter out already processed documents
         # _add_doc_keys = await self.doc_status.filter_keys(list(new_docs.keys()))
-        _add_doc_keys = {
-            doc_id
-            for doc_id in new_docs.keys()
-            if (current_doc := await self.doc_status.get_by_id(doc_id)) is None
-            or current_doc["status"] == DocStatus.FAILED
-        }
+        _add_doc_keys = set()
+        for doc_id in new_docs.keys():
+            current_doc = await self.doc_status.get_by_id(doc_id)
+
+            if current_doc is None:
+                _add_doc_keys.add(doc_id)
+                continue  # skip to the next doc_id
+
+            status = None
+            if isinstance(current_doc, dict):
+                status = current_doc["status"]
+            else:
+                status = current_doc.status
+
+            if status == DocStatus.FAILED:
+                _add_doc_keys.add(doc_id)
+
         new_docs = {k: v for k, v in new_docs.items() if k in _add_doc_keys}
 
         if not new_docs:
@@ -648,7 +663,7 @@ class LightRAG:
                     }
                     chunk_cnt += len(chunks)
                     await self.text_chunks.upsert(chunks)
-                    await self.text_chunks.change_status(doc_id, DocStatus.PROCESSED)
+                    await self.text_chunks.change_status(doc_id, DocStatus.PROCESSING)
 
                     try:
                         # Store chunks in vector database
@@ -915,7 +930,7 @@ class LightRAG:
                 else self.key_string_value_json_storage_cls(
                     namespace="llm_response_cache",
                     global_config=asdict(self),
-                    embedding_func=None,
+                    embedding_func=self.embedding_func,
                 ),
                 prompt=prompt,
             )
@@ -932,7 +947,7 @@ class LightRAG:
                 else self.key_string_value_json_storage_cls(
                     namespace="llm_response_cache",
                     global_config=asdict(self),
-                    embedding_func=None,
+                    embedding_func=self.embedding_func,
                 ),
             )
         elif param.mode == "mix":
@@ -951,7 +966,7 @@ class LightRAG:
                 else self.key_string_value_json_storage_cls(
                     namespace="llm_response_cache",
                     global_config=asdict(self),
-                    embedding_func=None,
+                    embedding_func=self.embedding_func,
                 ),
             )
         else:
@@ -992,7 +1007,7 @@ class LightRAG:
             or self.key_string_value_json_storage_cls(
                 namespace="llm_response_cache",
                 global_config=asdict(self),
-                embedding_func=None,
+                embedding_func=self.embedding_func,
             ),
         )
 
@@ -1023,7 +1038,7 @@ class LightRAG:
                 else self.key_string_value_json_storage_cls(
                     namespace="llm_response_cache",
                     global_config=asdict(self),
-                    embedding_func=None,
+                    embedding_func=self.embedding_funcne,
                 ),
             )
         elif param.mode == "naive":
@@ -1039,7 +1054,7 @@ class LightRAG:
                 else self.key_string_value_json_storage_cls(
                     namespace="llm_response_cache",
                     global_config=asdict(self),
-                    embedding_func=None,
+                    embedding_func=self.embedding_func,
                 ),
             )
         elif param.mode == "mix":
@@ -1058,7 +1073,7 @@ class LightRAG:
                 else self.key_string_value_json_storage_cls(
                     namespace="llm_response_cache",
                     global_config=asdict(self),
-                    embedding_func=None,
+                    embedding_func=self.embedding_func,
                 ),
             )
         else:

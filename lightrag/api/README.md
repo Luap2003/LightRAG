@@ -82,13 +82,18 @@ We provide an Ollama-compatible interfaces for LightRAG, aiming to emulate Light
 
 A query prefix in the query string can determines which LightRAG query mode is used to generate the respond for the query. The supported prefixes include:
 
+```
 /local
 /global
 /hybrid
 /naive
 /mix
+/bypass
+```
 
 For example, chat message "/mix 唐僧有几个徒弟" will trigger a mix mode query for LighRAG. A chat message without query prefix will trigger a hybrid mode query by default。
+
+"/bypass" is not a LightRAG query mode, it will tell API Server to pass the query directly to the underlying LLM with chat history. So user can use LLM to answer question base on the LightRAG query results. (If you are using Open WebUI as front end, you can just switch the model to a normal LLM instead of using /bypass prefix)
 
 #### Connect Open WebUI to LightRAG
 
@@ -97,6 +102,8 @@ After starting the lightrag-server, you can add an Ollama-type connection in the
 ## Configuration
 
 LightRAG can be configured using either command-line arguments or environment variables. When both are provided, command-line arguments take precedence over environment variables.
+
+For better performance, the API server's default values for TOP_K and COSINE_THRESHOLD are set to 50 and 0.4 respectively. If COSINE_THRESHOLD remains at its default value of 0.2 in LightRAG, many irrelevant entities and relations would be retrieved and sent to the LLM.
 
 ### Environment Variables
 
@@ -111,6 +118,17 @@ PORT=9621
 WORKING_DIR=/app/data/rag_storage
 INPUT_DIR=/app/data/inputs
 
+# RAG Configuration
+MAX_ASYNC=4
+MAX_TOKENS=32768
+EMBEDDING_DIM=1024
+MAX_EMBED_TOKENS=8192
+#HISTORY_TURNS=3
+#CHUNK_SIZE=1200
+#CHUNK_OVERLAP_SIZE=100
+#COSINE_THRESHOLD=0.4
+#TOP_K=50
+
 # LLM Configuration
 LLM_BINDING=ollama
 LLM_BINDING_HOST=http://localhost:11434
@@ -124,14 +142,8 @@ EMBEDDING_BINDING=ollama
 EMBEDDING_BINDING_HOST=http://localhost:11434
 EMBEDDING_MODEL=bge-m3:latest
 
-# RAG Configuration
-MAX_ASYNC=4
-MAX_TOKENS=32768
-EMBEDDING_DIM=1024
-MAX_EMBED_TOKENS=8192
-
 # Security
-LIGHTRAG_API_KEY=
+#LIGHTRAG_API_KEY=you-api-key-for-accessing-LightRAG
 
 # Logging
 LOG_LEVEL=INFO
@@ -186,10 +198,9 @@ PORT=7000 python lightrag.py
 | --ssl | False | Enable HTTPS |
 | --ssl-certfile | None | Path to SSL certificate file (required if --ssl is enabled) |
 | --ssl-keyfile | None | Path to SSL private key file (required if --ssl is enabled) |
+| --top-k | 50 | Number of top-k items to retrieve; corresponds to entities in "local" mode and relationships in "global" mode. |
+| --cosine-threshold | 0.4 | The cossine threshold for nodes and relations retrieval, works with top-k to control the retrieval of nodes and relations. |
 
-
-
-For protecting the server using an authentication key, you can also use an environment variable named `LIGHTRAG_API_KEY`.
 ### Example Usage
 
 #### Running a Lightrag server with ollama default local server as llm and embedding backends

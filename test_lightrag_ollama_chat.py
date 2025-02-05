@@ -18,6 +18,29 @@ from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 
+DEFAULT_CONFIG = {
+    "server": {
+        "host": "localhost",
+        "port": 9621,
+        "model": "lightrag:latest",
+        "timeout": 120,
+        "max_retries": 3,
+        "retry_delay": 1,
+    },
+    "test_cases": {
+        "basic": {"query": "唐僧有几个徒弟"},
+        "generate": {"query": "电视剧西游记导演是谁"},
+    },
+}
+
+# Example conversation history for testing
+EXAMPLE_CONVERSATION = [
+    {"role": "user", "content": "你好"},
+    {"role": "assistant", "content": "你好!我是一个AI助手,很高兴为你服务。"},
+    {"role": "user", "content": "Who are you?"},
+    {"role": "assistant", "content": "I'm a Knowledge base query assistant."},
+]
+
 
 class OutputControl:
     """Output control class, manages the verbosity of test output"""
@@ -99,35 +122,21 @@ class TestStats:
                     print(f"- {result.name}: {result.error}")
 
 
-DEFAULT_CONFIG = {
-    "server": {
-        "host": "localhost",
-        "port": 9621,
-        "model": "lightrag:latest",
-        "timeout": 120,
-        "max_retries": 3,
-        "retry_delay": 1,
-    },
-    "test_cases": {
-        "basic": {"query": "唐僧有几个徒弟"},
-        "generate": {"query": "电视剧西游记导演是谁"},
-    },
-}
-
-
 def make_request(
-    url: str, data: Dict[str, Any], stream: bool = False
+    url: str, data: Dict[str, Any], stream: bool = False, check_status: bool = True
 ) -> requests.Response:
     """Send an HTTP request with retry mechanism
     Args:
         url: Request URL
         data: Request data
         stream: Whether to use streaming response
+        check_status: Whether to check HTTP status code (default: True)
     Returns:
         requests.Response: Response object
 
     Raises:
         requests.exceptions.RequestException: Request failed after all retries
+        requests.exceptions.HTTPError: HTTP status code is not 200 (when check_status is True)
     """
     server_config = CONFIG["server"]
     max_retries = server_config["max_retries"]
@@ -137,6 +146,8 @@ def make_request(
     for attempt in range(max_retries):
         try:
             response = requests.post(url, json=data, stream=stream, timeout=timeout)
+            if check_status and response.status_code != 200:
+                response.raise_for_status()
             return response
         except requests.exceptions.RequestException as e:
             if attempt == max_retries - 1:  # Last retry
@@ -193,7 +204,6 @@ def create_chat_request_data(
     stream: bool = False,
     model: str = None,
     conversation_history: List[Dict[str, str]] = None,
-    history_turns: int = None,
 ) -> Dict[str, Any]:
     """Create chat request data
     Args:
@@ -206,10 +216,6 @@ def create_chat_request_data(
         Dictionary containing complete chat request data
     """
     messages = conversation_history or []
-    if history_turns is not None and conversation_history:
-        messages = messages[
-            -2 * history_turns :
-        ]  # Each turn has 2 messages (user + assistant)
     messages.append({"role": "user", "content": content})
 
     return {
@@ -273,23 +279,11 @@ def test_non_stream_chat() -> None:
     """Test non-streaming call to /api/chat endpoint"""
     url = get_base_url()
 
-    # Example conversation history
-    conversation_history = [
-        {"role": "user", "content": "你好"},
-        {"role": "assistant", "content": "你好!我是一个AI助手,很高兴为你服务。"},
-        {"role": "user", "content": "西游记里有几个主要人物?"},
-        {
-            "role": "assistant",
-            "content": "西游记的主要人物有唐僧、孙悟空、猪八戒、沙和尚这四位主角。",
-        },
-    ]
-
-    # Send request with conversation history and history turns
+    # Send request with conversation history
     data = create_chat_request_data(
         CONFIG["test_cases"]["basic"]["query"],
         stream=False,
-        conversation_history=conversation_history,
-        history_turns=2,  # Only include last 2 turns
+        conversation_history=EXAMPLE_CONVERSATION,
     )
     response = make_request(url, data)
 
@@ -325,23 +319,11 @@ def test_stream_chat() -> None:
     """
     url = get_base_url()
 
-    # Example conversation history
-    conversation_history = [
-        {"role": "user", "content": "你好"},
-        {"role": "assistant", "content": "你好!我是一个AI助手,很高兴为你服务。"},
-        {"role": "user", "content": "西游记里有几个主要人物?"},
-        {
-            "role": "assistant",
-            "content": "西游记的主要人物有唐僧、孙悟空、猪八戒、沙和尚这四位主角。",
-        },
-    ]
-
-    # Send request with conversation history and history turns
+    # Send request with conversation history
     data = create_chat_request_data(
         CONFIG["test_cases"]["basic"]["query"],
         stream=True,
-        conversation_history=conversation_history,
-        history_turns=2,  # Only include last 2 turns
+        conversation_history=EXAMPLE_CONVERSATION,
     )
     response = make_request(url, data, stream=True)
 
@@ -455,7 +437,7 @@ def test_stream_error_handling() -> None:
     if OutputControl.is_verbose():
         print("\n--- Testing empty message list (streaming) ---")
     data = create_error_test_data("empty_messages")
-    response = make_request(url, data, stream=True)
+    response = make_request(url, data, stream=True, check_status=False)
     print(f"Status code: {response.status_code}")
     if response.status_code != 200:
         print_json_response(response.json(), "Error message")
@@ -465,7 +447,7 @@ def test_stream_error_handling() -> None:
     if OutputControl.is_verbose():
         print("\n--- Testing invalid role field (streaming) ---")
     data = create_error_test_data("invalid_role")
-    response = make_request(url, data, stream=True)
+    response = make_request(url, data, stream=True, check_status=False)
     print(f"Status code: {response.status_code}")
     if response.status_code != 200:
         print_json_response(response.json(), "Error message")
@@ -475,7 +457,7 @@ def test_stream_error_handling() -> None:
     if OutputControl.is_verbose():
         print("\n--- Testing missing content field (streaming) ---")
     data = create_error_test_data("missing_content")
-    response = make_request(url, data, stream=True)
+    response = make_request(url, data, stream=True, check_status=False)
     print(f"Status code: {response.status_code}")
     if response.status_code != 200:
         print_json_response(response.json(), "Error message")
@@ -506,7 +488,7 @@ def test_error_handling() -> None:
         print("\n--- Testing empty message list ---")
     data = create_error_test_data("empty_messages")
     data["stream"] = False  # Change to non-streaming mode
-    response = make_request(url, data)
+    response = make_request(url, data, check_status=False)
     print(f"Status code: {response.status_code}")
     print_json_response(response.json(), "Error message")
 
@@ -515,7 +497,7 @@ def test_error_handling() -> None:
         print("\n--- Testing invalid role field ---")
     data = create_error_test_data("invalid_role")
     data["stream"] = False  # Change to non-streaming mode
-    response = make_request(url, data)
+    response = make_request(url, data, check_status=False)
     print(f"Status code: {response.status_code}")
     print_json_response(response.json(), "Error message")
 
@@ -524,7 +506,7 @@ def test_error_handling() -> None:
         print("\n--- Testing missing content field ---")
     data = create_error_test_data("missing_content")
     data["stream"] = False  # Change to non-streaming mode
-    response = make_request(url, data)
+    response = make_request(url, data, check_status=False)
     print(f"Status code: {response.status_code}")
     print_json_response(response.json(), "Error message")
 
@@ -631,7 +613,7 @@ def test_generate_error_handling() -> None:
     if OutputControl.is_verbose():
         print("\n=== Testing empty prompt ===")
     data = create_generate_request_data("", stream=False)
-    response = make_request(url, data)
+    response = make_request(url, data, check_status=False)
     print(f"Status code: {response.status_code}")
     print_json_response(response.json(), "Error message")
 
@@ -643,7 +625,7 @@ def test_generate_error_handling() -> None:
         options={"invalid_option": "value"},
         stream=False,
     )
-    response = make_request(url, data)
+    response = make_request(url, data, check_status=False)
     print(f"Status code: {response.status_code}")
     print_json_response(response.json(), "Error message")
 
@@ -664,6 +646,8 @@ def test_generate_concurrent() -> None:
         data = create_generate_request_data(prompt, stream=False)
         try:
             async with session.post(url, json=data) as response:
+                if response.status != 200:
+                    response.raise_for_status()
                 return await response.json()
         except Exception as e:
             return {"error": str(e)}
@@ -764,7 +748,7 @@ Configuration file (config.json):
         nargs="+",
         choices=list(get_test_cases().keys()) + ["all"],
         default=["all"],
-        help="Test cases to run, options: %(choices)s. Use 'all' to run all tests",
+        help="Test cases to run, options: %(choices)s. Use 'all' to run all tests （except error tests)",
     )
     return parser.parse_args()
 
@@ -788,21 +772,18 @@ if __name__ == "__main__":
 
     try:
         if "all" in args.tests:
-            # Run all tests
+            # Run all tests except error handling tests
             if OutputControl.is_verbose():
                 print("\n【Chat API Tests】")
             run_test(test_non_stream_chat, "Non-streaming Chat Test")
             run_test(test_stream_chat, "Streaming Chat Test")
             run_test(test_query_modes, "Chat Query Mode Test")
-            run_test(test_error_handling, "Chat Error Handling Test")
-            run_test(test_stream_error_handling, "Chat Streaming Error Test")
 
             if OutputControl.is_verbose():
                 print("\n【Generate API Tests】")
             run_test(test_non_stream_generate, "Non-streaming Generate Test")
             run_test(test_stream_generate, "Streaming Generate Test")
             run_test(test_generate_with_system, "Generate with System Prompt Test")
-            run_test(test_generate_error_handling, "Generate Error Handling Test")
             run_test(test_generate_concurrent, "Generate Concurrent Test")
         else:
             # Run specified tests
